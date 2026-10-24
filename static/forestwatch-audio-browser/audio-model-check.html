@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ForestWatch Live Audio Test</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 760px;
+      margin: 30px auto;
+      padding: 0 16px;
+      background: #101820;
+      color: #f2f5f7;
+    }
+
+    button {
+      padding: 12px 18px;
+      margin: 6px 6px 6px 0;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .panel {
+      margin: 16px 0;
+      padding: 15px;
+      background: #1d2935;
+      border-radius: 8px;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.7;
+    }
+
+    progress {
+      width: 100%;
+      height: 18px;
+    }
+
+    .muted {
+      color: #bdc9d5;
+      font-size: 14px;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>ForestWatch — Live Audio Test</h2>
+
+  <p id="status">Loading audio model...</p>
+
+  <button id="startButton" disabled>Start Microphone</button>
+  <button id="stopButton" disabled>Stop Microphone</button>
+
+  <div class="panel">
+    <h3>Microphone level</h3>
+    <p id="audioMetrics">Waiting for microphone...</p>
+    <progress id="levelMeter" max="0.1" value="0"></progress>
+    <p class="muted">
+      RMS measures signal strength. It does not identify the sound.
+    </p>
+  </div>
+
+  <div class="panel">
+    <h3>Audio classification</h3>
+    <pre id="results">Waiting for model...</pre>
+  </div>
+
+  <div class="panel">
+    <h3>ForestWatch trigger</h3>
+    <p id="triggerStatus">No chainsaw trigger sent yet.</p>
+  </div>
+
+  <script src="./edge-impulse-standalone.js"></script>
+  <script src="./run-impulse.js"></script>
+
+  <script>
+    "use strict";
+
+    const TARGET_RATE = 16000;
+    const SLICE_SIZE = 4000;
+    const THRESHOLD = 0.60;
+    const REQUIRED_CONSECUTIVE_SLICES = 2;
+    const TRIGGER_COOLDOWN_MS = 10000;
+    const MAX_QUEUED_SLICES = 8;
+
+    let classifier = null;
+    let modelReady = false;
+
+    let micStream = null;
+    let audioContext = null;
+    let sourceNode = null;
+    let processorNode = null;
+    let silentGain = null;
+
+    let running = false;
+    let inferenceBusy = false;
+
+    let pendingSamples = [];
+    let inferenceQueue = [];
+
+    let latestRms = 0;
+    let chainsawStreak = 0;
+    let lastTriggerAt = 0;
+    let droppedSliceCount = 0;
+
+    // State used when the browser microphone does not run at 16 kHz.
+    let totalInputSamples = 0;
+    let nextOutputPosition = 0;
+    let previousInputSample = null;
+
+    const statusEl = document.getElementById("status");
+    const audioMetricsEl = document.getElementById("audioMetrics");
+    const resultsEl = document.getElementById("results");
+    const triggerStatusEl = document.getElementById("triggerStatus");
+    const levelMeter = document.getElementById("levelMeter");
+
+    const startButton = document.getElementById("startButton");
+    const stopButton = document.getElementById("stopButton");
+
+    // --------------------------------------------------
+    // Load and validate the existing audio model.
+    // --------------------------------------------------
+
+    async function loadModel() {
+      try {
+        classifier = new EdgeImpulseClassifier();
+        await classifier.init();
+
+        const properties = classifier.getProperties();
+        const labels = properties.labels || [];
+
+        if (
+          Number(properties.frequency) !== TARGET_RATE ||
+          Number(properties.slice_size) !== SLICE_SIZE
+        ) {
+          throw new Error(
+            "Audio model settings do not match 16000 Hz and 4000 samples."
+          );
+        }
+
+        if (!labels.some(
+          label => String(label).toLowerCase() === "chainsaw detected"
+        )) {
+          throw new Error(
+            'Expected label "chainsaw detected" was not found.'
+          );
+        }
+
+        modelReady = true;
+        startButton.disabled = false;
+
+        statusEl.textContent =
+          "Audio model ready. Click Start Microphone.";
+
+        resultsEl.textContent = labels
+          .map(label => label + ": waiting for audio")
+          .join("\n");
+
+        console.log("Project:", classifier.getProjectInfo());
+        console.log("Model properties:", properties);
+
+      } catch (error) {
+        statusEl.textContent = "Audio model failed to load.";
+        resultsEl.textContent = error.stack || String(error);
+        console.error(error);
+      }
+    }
+
+    // --------------------------------------------------
+    // Display the audio level.
+    // --------------------------------------------------
+
+    function updateMicrophoneLevel(input) {
+      if (!input.length) return;
+
+      let sumSquares = 0;
+
+      for (let i = 0; i < input.length; i++) {
+        sumSquares += input[i] * input[i];
+      }
+
+      latestRms = Math.sqrt(sumSquares / input.length);
+
+      const levelDb = latestRms > 0
+        ? (20 * Math.log10(latestRms)).toFixed(1)
+        : "-Infinity";
+
+      audioMetricsEl.textContent =
+        "RMS: " + latestRms.toFixed(5) +
+        " | Level: " + levelDb + " dBFS" +
+        " | Input rate: " +
+        (audioContext ? audioContext.sampleRate : "N/A") + " Hz";
+
+      levelMeter.value = Math.min(latestRms, 0.1);
+    }
+
+    // --------------------------------------------------
+    // Resample continuously to 16 kHz if necessary.
+    // The state is preserved between microphone callbacks.
+    // --------------------------------------------------
+
+    function resetResampler() {
+      totalInputSamples = 0;
+      nextOutputPosition = 0;
+      previousInputSample = null;
+    }
+
+    function resampleTo16k(input, inputRate) {
+      if (inputRate === TARGET_RATE) {
+        return input;
+      }
+
+      if (!input.length) {
+        return new Float32Array(0);
+      }
+
+      const oldTotal = totalInputSamples;
+      const hasPrevious = previousInputSample !== null;
+
+      const combined = new Float32Array(
+        input.length + (hasPrevious ? 1 : 0)
+      );
+
+      if (hasPrevious) {
+        combined[0] = previousInputSample;
+        combined.set(input, 1);
+      } else {
+        combined.set(input);
+      }
+
+      const combinedStart = hasPrevious ? oldTotal - 1 : oldTotal;
+      const newTotal = oldTotal + input.length;
+      const ratio = inputRate / TARGET_RATE;
+      const output = [];
+
+      while (nextOutputPosition + 1 < newTotal) {
+        const localPosition =
+          nextOutputPosition - combinedStart;
+
+        if (localPosition < 0) {
+          nextOutputPosition += ratio;
+          continue;
+        }
+
+        const left = Math.floor(localPosition);
+
+        if (left + 1 >= combined.length) {
+          break;
+        }
+
+        const fraction = localPosition - left;
+
+        output.push(
+          combined[left] * (1 - fraction) +
+          combined[left + 1] * fraction
+        );
+
+        nextOutputPosition += ratio;
+      }
+
+      totalInputSamples = newTotal;
+      previousInputSample = input[input.length - 1];
+
+      return Float32Array.from(output);
+    }
+
+    // --------------------------------------------------
+    // Process each microphone callback into 4000-sample slices.
+    // --------------------------------------------------
+
+    function processAudio(event) {
+      if (!running || !audioContext) return;
+
+      const input = event.inputBuffer.getChannelData(0);
+
+      updateMicrophoneLevel(input);
+
+      const converted = resampleTo16k(
+        input,
+        audioContext.sampleRate
+      );
+
+      for (let i = 0; i < converted.length; i++) {
+        pendingSamples.push(converted[i]);
+      }
+
+      while (pendingSamples.length >= SLICE_SIZE) {
+        const slice = new Float32Array(
+          pendingSamples.splice(0, SLICE_SIZE)
+        );
+
+        enqueueSlice(slice);
+      }
+    }
+
+    // --------------------------------------------------
+    // Queue slices so continuous inference stays in order.
+    // --------------------------------------------------
+
+    function enqueueSlice(samples) {
+      if (samples.length !== SLICE_SIZE) {
+        console.error("Invalid slice length:", samples.length);
+        return;
+      }
+
+      inferenceQueue.push(samples);
+
+      // Prevent a backlog if the computer cannot keep up.
+      if (inferenceQueue.length > MAX_QUEUED_SLICES) {
+        inferenceQueue.shift();
+        droppedSliceCount++;
+      }
+
+      void drainInferenceQueue();
+    }
+
+    // --------------------------------------------------
+    // Continuous inference: one 4000-sample slice per call.
+    // --------------------------------------------------
+
+    async function drainInferenceQueue() {
+      if (inferenceBusy || !running || !classifier) {
+        return;
+      }
+
+      inferenceBusy = true;
+
+      try {
+        while (running && inferenceQueue.length > 0) {
+          const samples = inferenceQueue.shift();
+
+          const result = classifier.classifyContinuous(samples);
+
+          const rows = (result.results || [])
+            .slice()
+            .sort((a, b) => Number(b.value) - Number(a.value));
+
+          if (!rows.length) {
+            resultsEl.textContent =
+              "No classification results returned.";
+            continue;
+          }
+
+          resultsEl.textContent = rows.map(item =>
+            item.label + ": " +
+            (Number(item.value) * 100).toFixed(1) + "%"
+          ).join("\n");
+
+          if (droppedSliceCount > 0) {
+            resultsEl.textContent +=
+              "\n\nWarning: " + droppedSliceCount +
+              " audio slice(s) skipped because inference fell behind.";
+          }
+
+          const chainsawRow = rows.find(
+            item =>
+              String(item.label).toLowerCase() === "chainsaw detected"
+          );
+
+          const chainsawScore = chainsawRow
+            ? Number(chainsawRow.value)
+            : 0;
+
+          const strongest = rows[0];
+
+          statusEl.textContent =
+            "Listening | RMS: " + latestRms.toFixed(5) +
+            " | Highest: " + strongest.label +
+            " (" + (Number(strongest.value) * 100).toFixed(1) + "%)";
+
+          if (chainsawScore >= THRESHOLD) {
+            chainsawStreak++;
+          } else {
+            chainsawStreak = 0;
+          }
+
+          if (chainsawStreak >= REQUIRED_CONSECUTIVE_SLICES) {
+            chainsawStreak = 0;
+            void sendChainsawTrigger(chainsawScore);
+          }
+        }
+      } catch (error) {
+        statusEl.textContent =
+          "Inference failed: " + error.message;
+
+        console.error("Inference failed:", error);
+      } finally {
+        inferenceBusy = false;
+
+        if (running && inferenceQueue.length > 0) {
+          void drainInferenceQueue();
+        }
+      }
+    }
+
+    // --------------------------------------------------
+    // Send accepted chainsaw detections to Flask.
+    // --------------------------------------------------
+
+    async function sendChainsawTrigger(confidence) {
+      const now = Date.now();
+
+      if (now - lastTriggerAt < TRIGGER_COOLDOWN_MS) {
+        triggerStatusEl.textContent =
+          "Chainsaw score passed the threshold; waiting for cooldown.";
+        return;
+      }
+
+      lastTriggerAt = now;
+
+      triggerStatusEl.textContent =
+        "Sending chainsaw trigger...";
+
+      try {
+        const response = await fetch("/audio-trigger", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            label: "Chainsaw Detected",
+            confidence: confidence
+          })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok || data.ok !== true) {
+          throw new Error(
+            data.error || data.message || "Trigger was not accepted."
+          );
+        }
+
+        triggerStatusEl.textContent =
+          "Trigger accepted | Confidence: " +
+          (confidence * 100).toFixed(1) +
+          "% | ID: " + data.id;
+
+        console.log("ForestWatch audio trigger:", data);
+
+      } catch (error) {
+        triggerStatusEl.textContent =
+          "Trigger request failed: " + error.message;
+        console.error(error);
+      }
+    }
+
+    // --------------------------------------------------
+    // Start the laptop or webcam microphone.
+    // --------------------------------------------------
+
+    async function startMicrophone() {
+      if (!modelReady || running) return;
+
+      startButton.disabled = true;
+      statusEl.textContent = "Requesting microphone permission...";
+
+      try {
+        if (
+          !navigator.mediaDevices ||
+          !navigator.mediaDevices.getUserMedia
+        ) {
+          throw new Error(
+            "Microphone unavailable. Open http://127.0.0.1:5000/ " +
+            "or this test page through the local ForestWatch server."
+          );
+        }
+
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          }
+        });
+
+        const AudioContextClass =
+          window.AudioContext || window.webkitAudioContext;
+
+        audioContext = new AudioContextClass({
+          sampleRate: TARGET_RATE,
+          latencyHint: "interactive"
+        });
+
+        await audioContext.resume();
+
+        sourceNode =
+          audioContext.createMediaStreamSource(micStream);
+
+        processorNode =
+          audioContext.createScriptProcessor(4096, 1, 1);
+
+        silentGain = audioContext.createGain();
+        silentGain.gain.value = 0;
+
+        processorNode.onaudioprocess = processAudio;
+
+        sourceNode.connect(processorNode);
+        processorNode.connect(silentGain);
+        silentGain.connect(audioContext.destination);
+
+        pendingSamples = [];
+        inferenceQueue = [];
+        chainsawStreak = 0;
+        droppedSliceCount = 0;
+
+        resetResampler();
+
+        running = true;
+
+        startButton.disabled = true;
+        stopButton.disabled = false;
+
+        statusEl.textContent =
+          "Microphone active. Listening for chainsaw sounds.";
+
+        audioMetricsEl.textContent =
+          "Browser audio rate: " + audioContext.sampleRate + " Hz";
+
+        console.log(
+          "Microphone started. Input sample rate:",
+          audioContext.sampleRate
+        );
+
+      } catch (error) {
+        console.error("Microphone start failed:", error);
+
+        await stopMicrophone(false);
+
+        statusEl.textContent =
+          "Microphone start failed: " + error.message;
+      }
+    }
+
+    // --------------------------------------------------
+    // Stop microphone capture and clear buffered audio.
+    // --------------------------------------------------
+
+    async function stopMicrophone(showStatus = true) {
+      running = false;
+
+      if (processorNode) {
+        processorNode.onaudioprocess = null;
+        processorNode.disconnect();
+        processorNode = null;
+      }
+
+      if (sourceNode) {
+        sourceNode.disconnect();
+        sourceNode = null;
+      }
+
+      if (silentGain) {
+        silentGain.disconnect();
+        silentGain = null;
+      }
+
+      if (micStream) {
+        micStream.getTracks().forEach(track => track.stop());
+        micStream = null;
+      }
+
+      if (audioContext) {
+        await audioContext.close().catch(() => {});
+        audioContext = null;
+      }
+
+      pendingSamples = [];
+      inferenceQueue = [];
+      chainsawStreak = 0;
+      inferenceBusy = false;
+
+      resetResampler();
+
+      startButton.disabled = !modelReady;
+      stopButton.disabled = true;
+
+      audioMetricsEl.textContent = "Microphone stopped.";
+      levelMeter.value = 0;
+
+      if (showStatus) {
+        statusEl.textContent = "Microphone stopped.";
+      }
+    }
+
+    startButton.addEventListener("click", startMicrophone);
+
+    stopButton.addEventListener("click", () => {
+      void stopMicrophone();
+    });
+
+    window.addEventListener("beforeunload", () => {
+      if (micStream) {
+        micStream.getTracks().forEach(track => track.stop());
+      }
+    });
+
+    loadModel();
+  </script>
+</body>
+</html>
